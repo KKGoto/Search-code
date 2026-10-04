@@ -1,0 +1,19 @@
+#Temperature	Thermal Conductivity
+0	500
+50	600
+100	700
+
+#Temperature	kyoudo
+0	20000
+50	22000
+100	24000
+
+#Specific Heat
+0	250
+50	300
+100	350
+
+#Thermal Expansion Coefficient
+0	0.2
+50	0.4
+100	0.6

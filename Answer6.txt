@@ -1,0 +1,445 @@
+import os
+import re
+import pandas as pd
+from glob import glob
+
+
+class MaterialSampleSearcher:
+    def __init__(self, data_dir="material_data"):
+        self.data_dir = data_dir
+        self.samples = {}
+        
+        # 物性名の別名マッピング
+        self.property_aliases = {
+            # 熱伝導率
+            '熱伝導率': 'Thermal Conductivity',
+            'thermal conductivity': 'Thermal Conductivity',
+            # 引張強度
+            '引張強度': 'Tensile Strength',
+            'tensile strength': 'Tensile Strength',
+            '強度': 'Tensile Strength',
+            'kyoudo': 'Tensile Strength',
+            # 比熱
+            '比熱': 'Specific Heat',
+            'specific heat': 'Specific Heat',
+            'specific_heat': 'Specific Heat',
+            '比熱容量': 'Specific Heat',
+            # 熱膨張係数
+            '熱膨張係数': 'Thermal Expansion Coefficient',
+            'thermal expansion coefficient': 'Thermal Expansion Coefficient',
+            'thermal_expansion_coefficient': 'Thermal Expansion Coefficient',
+            '膨張係数': 'Thermal Expansion Coefficient',
+        }
+        
+        # 全物性の正規名リスト
+        self.all_properties = [
+            'Thermal Conductivity',
+            'Tensile Strength',
+            'Specific Heat',
+            'Thermal Expansion Coefficient'
+        ]
+        
+        os.makedirs(data_dir, exist_ok=True)
+    
+    def load_all_samples(self):
+        files = glob(os.path.join(self.data_dir, "*.txt"))
+        if not files:
+            print(f"警告: {self.data_dir} に .txt ファイルが見つかりません")
+            return
+        
+        for file_path in sorted(files):
+            self.load_file(file_path)
+        
+        print(f"\n合計: {len(self.samples)} サンプルを読み込みました")
+    
+    def load_file(self, file_path):
+        sample_name = os.path.splitext(os.path.basename(file_path))[0]
+        sections = self._parse_file(file_path)
+        
+        normalized = {}
+        for prop_name, df in sections.items():
+            normalized_name = self._normalize_property_name(prop_name)
+            normalized[normalized_name] = df
+        
+        self.samples[sample_name] = normalized
+        print(f"読み込み: {sample_name} -> {list(normalized.keys())}")
+    
+    def _parse_file(self, file_path):
+        sections = {}
+        current_property = None
+        current_data = []
+        
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    if current_property and current_data:
+                        sections[current_property] = self._create_df(current_data)
+                    current_property = None
+                    current_data = []
+                    continue
+                
+                if line.startswith('#'):
+                    if current_property and current_data:
+                        sections[current_property] = self._create_df(current_data)
+                    
+                    header_content = line[1:].strip()
+                    parts = re.split(r'\t+', header_content)
+                    
+                    if len(parts) >= 2:
+                        current_property = parts[1].strip()
+                    else:
+                        current_property = header_content.strip()
+                    
+                    current_data = []
+                else:
+                    parts = re.split(r'\t+', line.strip())
+                    if len(parts) >= 2:
+                        try:
+                            current_data.append((float(parts[0]), float(parts[1])))
+                        except ValueError:
+                            pass
+        
+        if current_property and current_data:
+            sections[current_property] = self._create_df(current_data)
+        
+        return sections
+    
+    def _create_df(self, data):
+        df = pd.DataFrame(data, columns=['Temperature', 'Value'])
+        df = df.sort_values('Temperature').reset_index(drop=True)
+        return df
+    
+    def _normalize_property_name(self, name):
+        key = name.strip().lower()
+        return self.property_aliases.get(key, name.strip())
+    
+    def _interpolate(self, df, target_temp):
+        temps = df['Temperature'].values
+        values = df['Value'].values
+        
+        if len(temps) == 0:
+            return None
+        
+        if len(temps) == 1:
+            return float(values[0])
+        
+        for i, t in enumerate(temps):
+            if abs(t - target_temp) < 1e-9:
+                return float(values[i])
+        
+        # 範囲より小さい場合：先頭2点から外挿
+        if target_temp < temps.min():
+            t1, t2 = temps[0], temps[1]
+            v1, v2 = values[0], values[1]
+            slope = (v2 - v1) / (t2 - t1)
+            return float(v1 + slope * (target_temp - t1))
+        
+        # 範囲より大きい場合：末尾2点から外挿
+        if target_temp > temps.max():
+            t1, t2 = temps[-2], temps[-1]
+            v1, v2 = values[-2], values[-1]
+            slope = (v2 - v1) / (t2 - t1)
+            return float(v1 + slope * (target_temp - t1))
+        
+        # 範囲内：線形補間
+        for i in range(len(temps) - 1):
+            t1, t2 = temps[i], temps[i+1]
+            v1, v2 = values[i], values[i+1]
+            if t1 <= target_temp <= t2:
+                return float(v1 + (v2 - v1) * (target_temp - t1) / (t2 - t1))
+        
+        return None
+    
+    def search(self, temperature, conditions):
+        results = {}
+        
+        for sample_name, properties in self.samples.items():
+            matched = True
+            sample_values = {}
+            
+            for cond in conditions:
+                prop_name = self._normalize_property_name(cond['property'])
+                threshold = cond['threshold']
+                direction = cond['direction']
+                
+                # 条件が "none" の場合は判定をスキップ（値は記録）
+                if (threshold is None or 
+                    (isinstance(threshold, str) and threshold.lower() == 'none') or
+                    (isinstance(direction, str) and direction.lower() == 'none')):
+                    if prop_name in properties:
+                        df = properties[prop_name]
+                        value = self._interpolate(df, temperature)
+                        if value is not None:
+                            sample_values[prop_name] = value
+                    continue
+                
+                # そのサンプルに指定物性が存在しない場合は除外
+                if prop_name not in properties:
+                    matched = False
+                    break
+                
+                df = properties[prop_name]
+                value = self._interpolate(df, temperature)
+                
+                if value is None:
+                    matched = False
+                    break
+                
+                sample_values[prop_name] = value
+                
+                # 条件判定
+                if direction == 'above' and value < threshold:
+                    matched = False
+                    break
+                elif direction == 'below' and value > threshold:
+                    matched = False
+                    break
+            
+            if matched:
+                results[sample_name] = sample_values
+        
+        return results
+    
+    def list_samples(self):
+        return list(self.samples.keys())
+    
+    def list_properties(self, sample_name=None):
+        if sample_name:
+            return list(self.samples.get(sample_name, {}).keys())
+        else:
+            props = set()
+            for s in self.samples.values():
+                props.update(s.keys())
+            return sorted(list(props))
+
+
+# ==================== 対話型入力インターフェース ====================
+
+def get_float_input(prompt, allow_none=False):
+    while True:
+        user_input = input(prompt).strip()
+        if allow_none and user_input.lower() == 'none':
+            return 'none'
+        try:
+            return float(user_input)
+        except ValueError:
+            print("  無効な入力です。数値を入力してください。")
+
+
+def get_direction_input(prompt):
+    print(f"\n【{prompt}】")
+    print("  1: 以上 (above)")
+    print("  2: 以下 (below)")
+    print("  3: 条件なし (none)")
+    
+    while True:
+        choice = input("  選択 (1/2/3): ").strip()
+        if choice == '1':
+            return 'above'
+        elif choice == '2':
+            return 'below'
+        elif choice == '3':
+            return 'none'
+        else:
+            print("  1, 2, 3 のいずれかを入力してください。")
+
+
+def get_sort_preference():
+    print("\n" + "-" * 40)
+    print("【検索結果の並び順を指定】")
+    
+    print("\n第一優先の物性を選択してください:")
+    print("  1: 熱伝導率 (Thermal Conductivity)")
+    print("  2: 引張強度 (Tensile Strength)")
+    print("  3: 比熱 (Specific Heat)")
+    print("  4: 熱膨張係数 (Thermal Expansion Coefficient)")
+    print("  5: ソートしない")
+    
+    prop_map = {
+        '1': 'Thermal Conductivity',
+        '2': 'Tensile Strength',
+        '3': 'Specific Heat',
+        '4': 'Thermal Expansion Coefficient',
+        '5': None
+    }
+    
+    while True:
+        prop_choice = input("  選択 (1/2/3/4/5): ").strip()
+        if prop_choice in prop_map:
+            sort_property = prop_map[prop_choice]
+            break
+        else:
+            print("  1～5 のいずれかを入力してください。")
+    
+    if sort_property is None:
+        return None
+    
+    print(f"\n【{sort_property} の並び順】")
+    print("  1: 大きい順 (降順)")
+    print("  2: 小さい順 (昇順)")
+    
+    while True:
+        order_choice = input("  選択 (1/2): ").strip()
+        if order_choice == '1':
+            ascending = False
+            order_name = "大きい順"
+            break
+        elif order_choice == '2':
+            ascending = True
+            order_name = "小さい順"
+            break
+        else:
+            print("  1 または 2 を入力してください。")
+    
+    print(f"  → {sort_property} で {order_name} に並べ替えます")
+    
+    return {
+        'property': sort_property,
+        'ascending': ascending,
+        'order_name': order_name
+    }
+
+
+def input_condition(property_name, display_name):
+    """1つの物性の条件を対話的に入力"""
+    print("\n" + "-" * 40)
+    print(f"【{display_name} ({property_name}) の条件】")
+    threshold = get_float_input("  閾値を入力してください (条件なしの場合は 'none'): ", allow_none=True)
+    
+    if threshold == 'none':
+        return {
+            "property": property_name,
+            "threshold": "none",
+            "direction": "none"
+        }
+    else:
+        direction = get_direction_input(f"{display_name}の判定方向")
+        return {
+            "property": property_name,
+            "threshold": threshold,
+            "direction": direction
+        }
+
+
+def sort_results(results, sort_pref):
+    if sort_pref is None or not results:
+        return results
+    
+    sort_prop = sort_pref['property']
+    ascending = sort_pref['ascending']
+    
+    sortable = []
+    unsortable = []
+    
+    for sample_name, values in results.items():
+        if sort_prop in values:
+            sortable.append((sample_name, values))
+        else:
+            unsortable.append((sample_name, values))
+    
+    sortable.sort(key=lambda x: x[1][sort_prop], reverse=not ascending)
+    
+    sorted_results = {}
+    for sample_name, values in sortable + unsortable:
+        sorted_results[sample_name] = values
+    
+    return sorted_results
+
+
+def display_results(results, conditions, temperature, sort_pref=None):
+    print("\n" + "=" * 60)
+    print("  検索結果")
+    print("=" * 60)
+    print(f"検索条件: 温度 = {temperature}")
+    
+    for cond in conditions:
+        threshold = cond['threshold']
+        direction = cond['direction']
+        if (threshold == 'none' or threshold is None or 
+            direction == 'none'):
+            print(f"  - {cond['property']}: 条件なし")
+        else:
+            direction_str = "以上" if direction == 'above' else "以下"
+            print(f"  - {cond['property']}: {threshold} {direction_str}")
+    
+    if sort_pref:
+        print(f"  - 並び順: {sort_pref['property']} で {sort_pref['order_name']}")
+    else:
+        print("  - 並び順: 指定なし")
+    
+    print("-" * 60)
+    
+    if not results:
+        print("\n条件に合致するサンプルは見つかりませんでした。")
+        return pd.DataFrame()
+    
+    print(f"\n合計 {len(results)} サンプルが条件に合致:\n")
+    
+    rows = []
+    for sample_name, values in results.items():
+        row = {'サンプル名': sample_name, '温度': temperature}
+        for prop, val in values.items():
+            row[prop] = round(val, 2)
+        rows.append(row)
+    
+    result_df = pd.DataFrame(rows)
+    print(result_df.to_string(index=False))
+    return result_df
+
+
+def interactive_search(searcher):
+    print("\n" + "=" * 60)
+    print("  材料物性データ 検索エンジン")
+    print("=" * 60)
+    
+    if not searcher.samples:
+        print("エラー: サンプルデータが読み込まれていません。")
+        return
+    
+    print(f"\n読み込み済みサンプル: {', '.join(searcher.list_samples())}")
+    print(f"利用可能な物性: {', '.join(searcher.list_properties())}")
+    
+    print("\n" + "-" * 40)
+    temperature = get_float_input("評価温度を入力してください: ")
+    
+    # 4つの物性の条件を入力
+    conditions = []
+    conditions.append(input_condition("Thermal Conductivity", "熱伝導率"))
+    conditions.append(input_condition("Tensile Strength", "引張強度"))
+    conditions.append(input_condition("Specific Heat", "比熱"))
+    conditions.append(input_condition("Thermal Expansion Coefficient", "熱膨張係数"))
+    
+    # 検索実行
+    results = searcher.search(temperature, conditions)
+    
+    # ソート
+    sort_pref = get_sort_preference()
+    sorted_results = sort_results(results, sort_pref)
+    
+    # 表示
+    display_results(sorted_results, conditions, temperature, sort_pref)
+    
+    return sorted_results
+
+
+def main():
+    searcher = MaterialSampleSearcher(data_dir="material_data")
+    searcher.load_all_samples()
+    
+    if not searcher.samples:
+        print("\nmaterial_data/ フォルダに .txt ファイルを配置してください。")
+        return
+    
+    while True:
+        interactive_search(searcher)
+        
+        print("\n" + "=" * 60)
+        retry = input("\nもう一度検索しますか？ (y/n): ").strip().lower()
+        if retry != 'y':
+            print("\n終了します。")
+            break
+
+
+if __name__ == "__main__":
+    main()
